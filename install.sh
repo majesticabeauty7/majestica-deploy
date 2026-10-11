@@ -18,7 +18,7 @@
 # Secrets are generated on the server, written to /root/majestica-secrets.txt (0600) and never printed.
 # =====================================================================================================================
 set -Eeuo pipefail
-: "${BUNDLE_URL:=https://raw.githubusercontent.com/majesticabeauty7/majestica-deploy/main/majestica-bundle.enc}"; : "${BUNDLE_SHA256:=799d64de13f9b35f27b9b50b84050d138456741edbd9c0a5b6746c5cd455091a}"; export BUNDLE_URL BUNDLE_SHA256
+: "${BUNDLE_URL:=https://raw.githubusercontent.com/majesticabeauty7/majestica-deploy/main/majestica-bundle.enc}"; : "${BUNDLE_SHA256:=6f37fb9d98dc7892bc79ed0c80c4589215438ddb0248d62966ab498e66900b44}"; export BUNDLE_URL BUNDLE_SHA256
 
 main() {
   # When piped (curl | bash) bash is reading this script from stdin: make sure no child command can swallow it.
