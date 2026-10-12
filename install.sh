@@ -18,7 +18,7 @@
 # Secrets are generated on the server, written to /root/majestica-secrets.txt (0600) and never printed.
 # =====================================================================================================================
 set -Eeuo pipefail
-: "${BUNDLE_URL:=https://raw.githubusercontent.com/majesticabeauty7/majestica-deploy/main/majestica-bundle.enc}"; : "${BUNDLE_SHA256:=c223908cc6e245a4ea3efa7b2ded2007640a63eccf0878f3580601144f9ea0fd}"; export BUNDLE_URL BUNDLE_SHA256
+: "${BUNDLE_URL:=https://raw.githubusercontent.com/majesticabeauty7/majestica-deploy/main/majestica-bundle.enc}"; : "${BUNDLE_SHA256:=763d157964d3412505bf9cd59ee2fe92af09801d6f2ea0d016f8ad8b0f7bf3d8}"; export BUNDLE_URL BUNDLE_SHA256
 
 main() {
   # When piped (curl | bash) bash is reading this script from stdin: make sure no child command can swallow it.
@@ -81,6 +81,15 @@ main() {
     [[ -n "$DB_PASS" ]] || DB_PASS="$(rand_hex 32)"
     [[ -n "$SESSION_SECRET" ]] || SESSION_SECRET="$(rand_hex 64)"
     [[ -n "$PLATFORM_ADMIN_KEY" ]] || PLATFORM_ADMIN_KEY="$(rand_hex 40)"
+    # v3: field-encryption key + backup passphrase. Generated ONCE, then always reused (from .env or the secrets file).
+    # NEVER regenerate FIELD_ENC_KEY: encrypted client data can only be read with the key it was written with.
+    FIELD_ENC_KEY="$(envget FIELD_ENC_KEY "$envf")"; [[ -n "$FIELD_ENC_KEY" ]] || FIELD_ENC_KEY="$(envget FIELD_ENC_KEY "$SECRETS_FILE")"
+    BACKUP_PASS="$(envget BACKUP_PASS "$SECRETS_FILE")"
+    if [[ -z "$FIELD_ENC_KEY" ]]; then
+      [[ -f "$APP_DIR/.field-key-issued" ]] && die "FIELD_ENC_KEY is missing from ${envf} and ${SECRETS_FILE} but a key was issued before. Restore it from your copy of ${SECRETS_FILE}; a new key would make encrypted data unreadable."
+      FIELD_ENC_KEY="$(openssl rand -hex 32)"
+    fi
+    [[ -n "$BACKUP_PASS" ]] || BACKUP_PASS="$(rand_hex 48)"
   }
 
   write_env() {
@@ -96,9 +105,11 @@ PLATFORM_ADMIN_KEY="${PLATFORM_ADMIN_KEY}"
 COOKIE_SECURE=${COOKIE_SECURE_VAL}
 SEED_DEMO=${SEED_DEMO_VAL}
 MAIL_MODE=stub
+FIELD_ENC_KEY=${FIELD_ENC_KEY}
 NEXT_TELEMETRY_DISABLED=1
 EOF
     chown "$APP_USER:$APP_USER" "$tmp"; chmod 600 "$tmp"; mv -f "$tmp" "$APP_DIR/.env"
+    [[ -f "$APP_DIR/.field-key-issued" ]] || { date '+%F %T' >"$APP_DIR/.field-key-issued"; chmod 600 "$APP_DIR/.field-key-issued"; }
   }
 
   write_secrets_file() {
@@ -109,6 +120,12 @@ PLATFORM_ADMIN_KEY=${PLATFORM_ADMIN_KEY}
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASSWORD=${DB_PASS}
+# FIELD_ENC_KEY encrypts client phone/email/address/notes and staff ID numbers. Generated ONCE, never regenerated.
+# KEEP AN OFFLINE COPY: without it the encrypted fields cannot be read (also not from backups).
+FIELD_ENC_KEY=${FIELD_ENC_KEY}
+# BACKUP_PASS decrypts the nightly backups in /var/backups/majestica:
+#   openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:<BACKUP_PASS> -in FILE.sql.gz.enc | gunzip > restore.sql
+BACKUP_PASS=${BACKUP_PASS}
 # SESSION_SECRET and the full DATABASE_URL live in ${APP_DIR}/.env (root + ${APP_USER} only)
 # Platform console: https://${DOMAIN}/platform  (enter PLATFORM_ADMIN_KEY)
 EOF
@@ -269,7 +286,7 @@ EOF
       mkdir -p "$work/stage"; tar -xzf "$work/bundle.tar.gz" -C "$work/stage"
       [[ -f "$work/stage/package.json" && -f "$work/stage/prisma/schema.prisma" ]] || die "bundle does not look like the Majestica app"
       grep -q 'provider *= *"postgresql"' "$work/stage/prisma/schema.prisma" || die "bundle schema is not PostgreSQL"
-      rsync -a --delete --exclude=/.env --exclude=/node_modules --exclude=/.next --exclude=/.seeded --exclude=/outbox.log "$work/stage"/ "$APP_DIR"/
+      rsync -a --delete --exclude=/.env --exclude=/node_modules --exclude=/.next --exclude=/.seeded --exclude=/.field-key-issued --exclude=/outbox.log "$work/stage"/ "$APP_DIR"/
       chown -R "$APP_USER:$APP_USER" "$APP_DIR"
       app_changed=1
       info "unpacked to ${APP_DIR}"
@@ -296,6 +313,9 @@ EOF
       else
         info "seed skipped (SEED_DEMO=${SEED_DEMO_VAL}, marker: $([[ -f $APP_DIR/.seeded ]] && echo present || echo absent))"
       fi
+      info "v3 upgrade: new role permissions + encrypt existing sensitive fields (idempotent, deletes nothing)"
+      as_app "set -a; . ./.env; set +a; npm run --silent db:upgrade" || die "db upgrade failed (no data was deleted; see the log above)"
+      rm -rf "$APP_DIR/.next"   # always a clean build: stale chunks from the previous version must not survive
       as_app "set -a; . ./.env; set +a; npm run build"
     fi
   fi
@@ -327,7 +347,41 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    # nightly encrypted database backup (pg_dump | gzip | AES-256), 14 days kept
+    install -d -m 700 /var/backups/majestica
+    ( umask 077; printf '%s' "$BACKUP_PASS" >/root/.majestica-backup-pass ); chmod 600 /root/.majestica-backup-pass
+    cat >/usr/local/sbin/majestica-backup <<BKEOF
+#!/usr/bin/env bash
+# Majestica nightly backup: encrypted pg_dump, 14 days kept. Decrypt with BACKUP_PASS from ${SECRETS_FILE}.
+set -euo pipefail
+umask 077
+out="/var/backups/majestica/${DB_NAME}-\$(date +%F-%H%M).sql.gz.enc"
+runuser -u postgres -- pg_dump --no-owner --no-privileges "${DB_NAME}" | gzip -9 | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/root/.majestica-backup-pass -out "\$out.part"
+mv -f "\$out.part" "\$out"
+find /var/backups/majestica -maxdepth 1 -name '${DB_NAME}-*.sql.gz.enc' -mtime +13 -delete
+find /var/backups/majestica -maxdepth 1 -name '*.part' -mmin +120 -delete
+BKEOF
+    chmod 700 /usr/local/sbin/majestica-backup
+    cat >/etc/systemd/system/majestica-backup.service <<BKEOF
+[Unit]
+Description=Majestica Digital encrypted database backup
+After=postgresql.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/majestica-backup
+BKEOF
+    cat >/etc/systemd/system/majestica-backup.timer <<BKEOF
+[Unit]
+Description=Nightly Majestica database backup (02:30)
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=10m
+[Install]
+WantedBy=timers.target
+BKEOF
     systemctl daemon-reload
+    systemctl enable --now majestica-backup.timer >/dev/null 2>&1 || warn "could not enable the backup timer"
     systemctl enable majestica >/dev/null 2>&1
     systemctl restart majestica
     for _ in $(seq 1 60); do
@@ -418,7 +472,9 @@ EOF
   App            : ${APP_DIR}   (systemd unit: majestica, runs as '${APP_USER}' on 127.0.0.1:${APP_PORT})
   Try it now     : http://${pub}/login           (raw IP fallback, plain HTTP)
   Domain         : http://${DOMAIN}/login        (once DNS A record -> ${pub})
-  Secrets        : ${SECRETS_FILE}  (chmod 600; PLATFORM_ADMIN_KEY + DB password - not shown on screen)
+  Secrets        : ${SECRETS_FILE}  (chmod 600; PLATFORM_ADMIN_KEY, DB password, FIELD_ENC_KEY, BACKUP_PASS - not shown)
+                   COPY IT OFF THE SERVER: FIELD_ENC_KEY is needed to read encrypted client data.
+  Backups        : nightly 02:30 -> /var/backups/majestica (encrypted, 14 days kept)   run now: majestica-backup
                    read them with:  cat ${SECRETS_FILE}
   Platform console: /platform  (needs PLATFORM_ADMIN_KEY)
   Demo data      : SEED_DEMO=${SEED_DEMO_VAL}$( [[ "$SEED_DEMO_VAL" == "true" ]] && echo " -> EXAMPLE salon: demo@majestica.example / Demo@1234 (public password! change/remove before real use)")
