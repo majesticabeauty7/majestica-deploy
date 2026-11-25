@@ -122,17 +122,21 @@ restore_from_backup() {
   else
     printf 'ERROR: app backup missing, cannot restore files\n' >&2
   fi
-  if [[ -f "$BK/buntys_app.dump" ]]; then
+  if [[ -s "$BK/buntys_app.dump" ]]; then
     local db
     db="$(db_name || true)"
     db="${db:-buntys_app}"
     if [[ "$db" == *majestica* ]]; then
       printf 'ERROR: refusing to restore a Majestica-looking database name\n' >&2
     else
-      runuser -u postgres -- pg_restore --clean --if-exists --no-owner --no-privileges --dbname="$db" "$BK/buntys_app.dump" \
+      # postgres cannot read a root-only 0600 file in a 0700 dir; root feeds the dump on stdin.
+      set +o xtrace
+      runuser -u postgres -- pg_restore --clean --if-exists --no-owner --no-privileges --dbname="$db" <"$BK/buntys_app.dump" \
         && ok "restored database $db" \
         || printf 'ERROR: database restore failed\n' >&2
     fi
+  else
+    printf 'ERROR: database dump missing or empty, cannot restore DB\n' >&2
   fi
   systemctl start "$UNIT" || true
   sleep 3
@@ -165,9 +169,15 @@ install -d -m 700 "$BK"
 if [[ -x /usr/local/sbin/buntys-backup ]]; then
   /usr/local/sbin/buntys-backup && ok "nightly-style encrypted dump ran" || info "nightly-style backup returned non-zero (continuing with a local dump)"
 fi
-runuser -u postgres -- pg_dump --format=custom --no-owner --no-privileges --file="$BK/buntys_app.dump" "$DB_NAME" \
+# postgres cannot create files in a root-owned 0700 directory, so dump to stdout and let root write the file.
+set +o xtrace
+runuser -u postgres -- pg_dump --format=custom --no-owner --no-privileges "$DB_NAME" >"$BK/buntys_app.dump" \
   || die "pg_dump of buntys_app failed - nothing was changed"
 chmod 600 "$BK/buntys_app.dump"
+dump_sz="$(stat -c %s "$BK/buntys_app.dump" 2>/dev/null || echo 0)"
+[[ "$dump_sz" -gt 0 ]] || die "pg_dump wrote an empty file - nothing was changed"
+pg_restore --list "$BK/buntys_app.dump" >/dev/null || die "pg_dump output is not a valid archive - nothing was changed"
+ok "database dump ${dump_sz} bytes"
 # Keep .env and built assets so rollback can restart without a rebuild if possible.
 tar --exclude=node_modules -C "$APP_DIR" -czf "$BK/opt-buntys.tar.gz" .
 chmod 600 "$BK/opt-buntys.tar.gz"
